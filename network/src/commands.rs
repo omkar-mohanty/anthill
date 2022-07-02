@@ -1,7 +1,9 @@
 use super::eventloop::FileResponse;
-use libp2p::{request_response::ResponseChannel, Multiaddr, PeerId};
-use std::{collections::HashSet, error::Error};
 use futures::channel::oneshot::Sender;
+use libp2p::{
+    gossipsub::IdentTopic as Topic, request_response::ResponseChannel, Multiaddr, PeerId,
+};
+use std::{collections::HashSet, error::Error};
 #[derive(Debug)]
 pub enum Command {
     StartListening {
@@ -29,5 +31,14 @@ pub enum Command {
     RespondFile {
         file: String,
         channel: ResponseChannel<FileResponse>,
+    },
+    SendMessage {
+        topic: Topic,
+        message: String,
+        sender: Sender<Result<(), Box<dyn Error + Send>>>,
+    },
+    Subscribe {
+        topic: Topic,
+        sender: Sender<Result<(), Box<dyn Error + Send>>>,
     },
 }
