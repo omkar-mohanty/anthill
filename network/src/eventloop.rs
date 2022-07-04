@@ -4,12 +4,15 @@ use futures::channel::{mpsc, oneshot};
 use futures::{AsyncRead, AsyncWrite, AsyncWriteExt, SinkExt, StreamExt};
 use libp2p::core::either::EitherError;
 use libp2p::gossipsub::error::GossipsubHandlerError;
-use libp2p::gossipsub::{Gossipsub, GossipsubEvent};
+use libp2p::gossipsub::{
+    Gossipsub, GossipsubConfigBuilder, GossipsubEvent, MessageAuthenticity, ValidationMode, GossipsubMessage, MessageId,
+};
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{GetProvidersOk, Kademlia, KademliaEvent, QueryId, QueryResult};
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{
-    RequestId, RequestResponse, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
+    ProtocolSupport, RequestId, RequestResponse, RequestResponseEvent, RequestResponseMessage,
+    ResponseChannel,
 };
 use libp2p::swarm::{ConnectionHandlerUpgrErr, Swarm, SwarmEvent};
 use libp2p::{
@@ -17,13 +20,18 @@ use libp2p::{
         upgrade::{read_length_prefixed, write_length_prefixed},
         ProtocolName,
     },
+    development_transport,
     request_response::RequestResponseCodec,
     NetworkBehaviour, PeerId,
 };
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
+    iter,
+    time::Duration,
 };
 /// Main event loop of the sky damemon.  
 /// Provides files to peers, queries other peers for files, and recieves files from other peers.
@@ -39,7 +47,7 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
-    fn new(
+    pub fn new(
         swarm: Swarm<ComposedBehaviour>,
         command_receiver: mpsc::Receiver<Command>,
         event_sender: mpsc::Sender<Event>,
@@ -55,6 +63,48 @@ impl EventLoop {
         }
     }
 
+    pub async fn default(
+    ) -> Result<(Self, mpsc::Sender<Command>, mpsc::Receiver<Event>, PeerId), Box<dyn Error>> {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from_public_key(&keypair.public());
+        let transport = development_transport(keypair.clone()).await?;
+
+        let message_id_fn =  |message: &GossipsubMessage| {
+            let mut s = DefaultHasher::new(); 
+            message.data.hash(&mut s);
+            MessageId::from(s.finish().to_string()) 
+        };
+
+        let config = GossipsubConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(1))
+            .validation_mode(ValidationMode::Strict)
+            .message_id_fn(message_id_fn)
+            .build()
+            .expect("Correct Config");
+
+        let behaviour = ComposedBehaviour {
+            gossipsub: Gossipsub::new(MessageAuthenticity::Signed(keypair), config)
+                .expect("correct configuration"),
+            kademlia: Kademlia::new(peer_id, MemoryStore::new(peer_id)),
+            request_response: RequestResponse::new(
+                FileExchangeCodec(),
+                iter::once((FileExchangeProtocol(), ProtocolSupport::Full)),
+                Default::default(),
+            ),
+        };
+
+        let (command_sender, command_receiver) = mpsc::channel::<Command>(1);
+        let (event_sender, event_reveiver) = mpsc::channel::<Event>(1);
+
+        let swarm = Swarm::new(transport, behaviour, peer_id.clone());
+
+        Ok((
+            Self::new(swarm, command_receiver, event_sender),
+            command_sender,
+            event_reveiver,
+            peer_id,
+        ))
+    }
     async fn handle_gossipsub_event(&mut self, event: GossipsubEvent) {
         match event {
             GossipsubEvent::Subscribed { peer_id, .. } => {
@@ -298,17 +348,18 @@ impl EventLoop {
                     .send_response(channel, FileResponse(file))
                     .expect("Connection to peer to be still open.");
             }
-            Command::SendMessage { message, topic , sender} => {
+            Command::SendMessage {
+                message,
+                topic,
+                sender,
+            } => {
                 println!("Sending message");
                 self.swarm
                     .behaviour_mut()
                     .gossipsub
                     .publish(topic, message.into_bytes())
                     .expect("Message sent");
-              match  sender.send(Ok(())) {
-                 Ok(_) => {},
-                 Err(_) => {}
-              } 
+                let _ = sender.send(Ok(()));
             }
             Command::Subscribe { topic, sender } => {
                 self.swarm
@@ -316,10 +367,7 @@ impl EventLoop {
                     .gossipsub
                     .subscribe(&topic)
                     .expect("Subscript to topic");
-               match sender.send(Ok(())) {
-                    Ok(_) => {},
-                    Err(_) => {}
-               }
+                let _ = sender.send(Ok(()));
             }
         }
     }
@@ -327,14 +375,14 @@ impl EventLoop {
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "ComposedEvent")]
-struct ComposedBehaviour {
+pub struct ComposedBehaviour {
     request_response: RequestResponse<FileExchangeCodec>,
     kademlia: Kademlia<MemoryStore>,
     gossipsub: Gossipsub,
 }
 
 #[derive(Debug)]
-enum ComposedEvent {
+pub enum ComposedEvent {
     RequestResponse(RequestResponseEvent<FileRequest, FileResponse>),
     Kademlia(KademliaEvent),
     Gossipsub(GossipsubEvent),
@@ -368,11 +416,11 @@ pub enum Event {
 // Simple file exchange protocol
 
 #[derive(Debug, Clone)]
-struct FileExchangeProtocol();
+pub struct FileExchangeProtocol();
 #[derive(Clone)]
-struct FileExchangeCodec();
+pub struct FileExchangeCodec();
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileRequest(String);
+pub struct FileRequest(String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileResponse(String);
 
@@ -567,11 +615,20 @@ mod tests {
                 sender: tx,
             })
             .await?;
-        let _ =rc.await?;
+        let _ = rc.await?;
         let (tx, rc) = oneshot::channel();
         command_sender
             .send(Command::Subscribe {
                 topic: test_topic.clone(),
+                sender: tx,
+            })
+            .await?;
+        let _ = rc.await?;
+
+        let (tx, rc) = oneshot::channel();
+        command_sender_recv
+            .send(Command::StartListening {
+                addr: "/ip4/0.0.0.0/tcp/0".parse()?,
                 sender: tx,
             })
             .await?;
@@ -595,7 +652,7 @@ mod tests {
             .await?;
 
         let _ = rc.await?;
-       
+
         let (tx, rc) = oneshot::channel();
         command_sender_recv
             .send(Command::SendMessage {
@@ -605,7 +662,7 @@ mod tests {
             })
             .await?;
 
-      let _ = rc.await?;
+        let _ = rc.await?;
         Ok(())
     }
 }
