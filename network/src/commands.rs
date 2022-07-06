@@ -21,4 +21,10 @@ pub enum Command {
         topic: Topic,
         sender: Sender<Result<(), Box<dyn Error + Send>>>,
     },
+    PeerId {
+        sender: Sender<PeerId>,
+    },
+    ListeningAddr {
+        sender: Sender<Multiaddr>,
+    },
 }

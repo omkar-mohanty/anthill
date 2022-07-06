@@ -8,24 +8,33 @@ use std::time::Duration;
 use libp2p::core::ConnectedPoint;
 use libp2p::gossipsub::error::GossipsubHandlerError;
 use libp2p::gossipsub::{
-    Gossipsub, GossipsubConfigBuilder, GossipsubEvent, GossipsubMessage, MessageId, TopicHash,
+    Gossipsub, GossipsubConfigBuilder, GossipsubEvent, GossipsubMessage, IdentTopic as Topic,
+    MessageId, TopicHash,
 };
 use libp2p::swarm::SwarmEvent;
-use libp2p::{development_transport, identity};
+use libp2p::{development_transport, identity, Multiaddr};
 use libp2p::{multiaddr::Protocol, NetworkBehaviour, PeerId, Swarm};
 
-use futures::channel::{mpsc, oneshot};
+use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
 
+/// Main event loop of the application
+/// Can run independently from any other component.
 pub struct EventLoop {
-    message_handler: Box<dyn Fn(PeerId, MessageId, GossipsubMessage) + Sync + Send>,
-    sub_handler: Box<dyn Fn(PeerId, TopicHash) + Sync + Send>,
-    unsub_handler: Box<dyn Fn(PeerId, TopicHash) + Sync + Send>,
+    /// Libp2p swarm
     swarm: Swarm<ComposedBehaviour>,
+    /// All connected peers to the current node
     connected_peers: HashMap<PeerId, ConnectedPoint>,
+    /// All messages received by the node
     messages: HashMap<MessageId, GossipsubMessage>,
+    /// Network event manager
     event_sender: mpsc::Sender<Event>,
+    /// Command receiver from client/user
     command_receiver: mpsc::Receiver<Command>,
+    /// Current listening address of the node
+    listening_addr: Multiaddr,
+    /// Topics the node is sibscribed to
+    topics: HashMap<TopicHash, Topic>,
 }
 
 impl EventLoop {
@@ -47,13 +56,26 @@ impl EventLoop {
             } => {
                 self.messages.insert(message_id.clone(), message.clone());
 
-                (self.message_handler)(propagation_source, message_id, message);
+                let _ = self
+                    .event_sender
+                    .send(Event::Message {
+                        propagation_source,
+                        message_id,
+                        message,
+                    })
+                    .await;
             }
             GossipsubEvent::Subscribed { peer_id, topic } => {
-                (self.sub_handler)(peer_id, topic);
+                let _ = self
+                    .event_sender
+                    .send(Event::Subscribed { peer_id, topic })
+                    .await;
             }
             GossipsubEvent::Unsubscribed { peer_id, topic } => {
-                (self.unsub_handler)(peer_id, topic);
+                let _ = self
+                    .event_sender
+                    .send(Event::Unsubscribed { peer_id, topic })
+                    .await;
             }
             GossipsubEvent::GossipsubNotSupported { .. } => {}
         }
@@ -70,10 +92,10 @@ impl EventLoop {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                self.connected_peers.insert(peer_id, endpoint);
+                self.connected_peers.insert(peer_id, endpoint.clone());
                 let _ = self
                     .event_sender
-                    .send(Event::ConnectionEstablished(peer_id))
+                    .send(Event::ConnectionEstablished { peer_id, endpoint })
                     .await;
             }
 
@@ -88,17 +110,32 @@ impl EventLoop {
             SwarmEvent::NewListenAddr { address, .. } => {
                 let local_peer_id = *self.swarm.local_peer_id();
 
-                println!(
-                    "Local node listening on {:?}",
-                    address.with(Protocol::P2p(local_peer_id.into()))
-                );
+                self.listening_addr = address.with(Protocol::P2p(local_peer_id.into()));
+
+                let _ = self
+                    .event_sender
+                    .send(Event::NewListenAddr {
+                        addr: self.listening_addr.clone(),
+                    })
+                    .await;
             }
 
             SwarmEvent::BannedPeer { peer_id, .. } => {
                 println!("{:?} Has been banned", peer_id);
             }
 
-            SwarmEvent::IncomingConnection { .. } => {}
+            SwarmEvent::IncomingConnection {
+                local_addr,
+                send_back_addr,
+            } => {
+                let _ = self
+                    .event_sender
+                    .send(Event::IncomingConnection {
+                        local_addr,
+                        send_back_addr,
+                    })
+                    .await;
+            }
             SwarmEvent::IncomingConnectionError { .. } => {}
             SwarmEvent::OutgoingConnectionError { .. } => {}
             SwarmEvent::ExpiredListenAddr { .. } => {}
@@ -110,54 +147,75 @@ impl EventLoop {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::StartListening { addr, sender } => {
-                let _ = self.swarm.listen_on(addr);
-                let _ = sender.send(Ok(()));
+                if let Err(err) = self.swarm.listen_on(addr) {
+                    let _ = sender.send(Err(Box::new(err)));
+                } else {
+                    let _ = sender.send(Ok(()));
+                }
             }
 
-            Command::Dial { peer_id, peer_addr, sender } => {
-                let _ = self.swarm.dial(peer_addr);
-
-                let _ = self
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .add_explicit_peer(&peer_id);
-
-                let _ = sender.send(Ok(()));
+            Command::Dial {
+                peer_id,
+                peer_addr,
+                sender,
+            } => {
+                match self.swarm.dial(peer_addr) {
+                    Ok(_) => {
+                        self.swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .add_explicit_peer(&peer_id);
+                        let _ = sender.send(Ok(()));
+                    }
+                    Err(err) => {
+                        let _ = sender.send(Err(Box::new(err)));
+                    }
+                };
             }
 
-            Command::SendMessage { topic, message, sender } => {
-                let _ = self.swarm.behaviour_mut().gossipsub.publish(topic,message);
-
-                let _ =sender.send(Ok(()));
+            Command::SendMessage {
+                topic,
+                message,
+                sender,
+            } => {
+                match self.swarm.behaviour_mut().gossipsub.publish(topic, message) {
+                    Ok(_) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    Err(err) => {
+                        let _ = sender.send(Err(Box::new(err)));
+                    }
+                };
             }
 
             Command::Subscribe { topic, sender } => {
-                let _ = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                if let Err(err) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                    self.topics.insert(topic.hash(), topic);
+                    let _ = sender.send(Err(Box::new(err)));
+                } else {
+                    let _ = sender.send(Ok(()));
+                }
+            }
 
-                let _ = sender.send(Ok(()));
+            Command::PeerId { sender } => {
+                let peer_id = *self.swarm.local_peer_id();
+
+                let _ = sender.send(peer_id);
+            }
+
+            Command::ListeningAddr { sender } => {
+                let listening_addr = self.listening_addr.clone();
+
+                let _ = sender.send(listening_addr);
             }
         }
     }
 
+    /// Creates new event loop with default settings
     pub async fn new(
         event_sender: mpsc::Sender<Event>,
         command_receiver: mpsc::Receiver<Command>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let message_handler = Box::new(
-            |peer_id: PeerId, _message_id: MessageId, message: GossipsubMessage| {
-                println!("{:?}: {:?}", peer_id, message);
-            },
-        );
-
-        let sub_handler = Box::new(|peer_id: PeerId, topic: TopicHash| {
-            println!("{:?} subscribed to {:?}", peer_id, topic);
-        });
-
-        let unsub_handler = Box::new(|peer_id: PeerId, topic: TopicHash| {
-            println!("{:?} subscribed to {:?}", peer_id, topic);
-        });
-
         let keypair = identity::Keypair::generate_ed25519();
 
         let peer_id = PeerId::from(keypair.public());
@@ -186,19 +244,19 @@ impl EventLoop {
         let swarm = Swarm::new(transport, behaviour, peer_id);
 
         Ok(Self {
-            message_handler,
-            sub_handler,
-            unsub_handler,
             event_sender,
             command_receiver,
             swarm,
             connected_peers: Default::default(),
             messages: Default::default(),
+            topics: Default::default(),
+            listening_addr: "/ip4/0.0.0.0/tcp/0".parse()?,
         })
     }
 
-    async fn run(&mut self) {
-        
+    /// Starts the event loop
+    /// Best to run in a separate thread
+    pub async fn run(mut self) {
         loop {
             futures::select! {
                 event = self.swarm.select_next_some() => {
@@ -213,12 +271,15 @@ impl EventLoop {
     }
 }
 
+///Network Behaviour of the node
+/// TODO Add support for Kademilia and request response
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "ComposedEvent")]
 pub struct ComposedBehaviour {
     gossipsub: Gossipsub,
 }
 
+/// Libp2p events
 #[derive(Debug)]
 pub enum ComposedEvent {
     Gossipsub(GossipsubEvent),
@@ -236,34 +297,192 @@ mod tests {
 
     use super::*;
 
-    use std::error;
+    use std::{error, str::FromStr};
+
+    use futures::channel::{mpsc, oneshot};
+
+    use libp2p::gossipsub::IdentTopic as Topic;
+
+    async fn event_loop(
+    ) -> Result<(mpsc::Sender<Command>, mpsc::Receiver<Event>), Box<dyn error::Error>> {
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
+
+        let (mut command_sender, rx) = mpsc::channel(1);
+
+        let event_loop = EventLoop::new(event_sender, rx).await?;
+
+        spawn(event_loop.run());
+
+        let (tx, rx) = oneshot::channel();
+
+        command_sender
+            .send(Command::StartListening {
+                addr: "/ip4/0.0.0.0/tcp/0".parse()?,
+                sender: tx,
+            })
+            .await?;
+
+        let _ = rx.await;
+
+        Ok((command_sender, event_receiver))
+    }
 
     #[tokio::test]
     async fn test_default() -> Result<(), Box<dyn error::Error>> {
-        let (event_sender, _) = mpsc::channel(1);
+        let (event_sender, _) = mpsc::channel(10);
 
-        let (_, rx) =mpsc::channel(1);
+        let (_, rx) = mpsc::channel(10);
 
         let _ = EventLoop::new(event_sender, rx).await?;
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_command() -> Result<(), Box<dyn error::Error>> {
-        let (event_sender, event_receiver) = mpsc::channel(1);
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
 
-        let (mut command_sender, rx) =mpsc::channel(1);
+        let (mut command_sender, rx) = mpsc::channel(1);
 
-        let mut event_loop = EventLoop::new(event_sender, rx).await?;
+        let event_loop = EventLoop::new(event_sender, rx).await?;
 
-        spawn( event_loop.run());
+        spawn(event_loop.run());
 
-        let (tx, rx) =oneshot::channel();
+        let (tx, rx) = oneshot::channel();
 
-        command_sender.send(Command::StartListening { addr:"/ip4/0.0.0.0/tcp/0".parse()? , sender: tx }).await;
+        command_sender
+            .send(Command::StartListening {
+                addr: "/ip4/0.0.0.0/tcp/0".parse()?,
+                sender: tx,
+            })
+            .await?;
 
-        rx.await;
+        let _ = rx.await;
+
+        let result = event_receiver.select_next_some().await;
+
+        if let Event::NewListenAddr { .. } = result {
+            return Ok(());
+        }
+
+        panic!("Failed");
+    }
+
+    #[tokio::test]
+    async fn test_dial() -> Result<(), Box<dyn error::Error>> {
+        let (mut dialed_command, mut dailed_event_receiver) = event_loop().await?;
+        let (mut dialer_command, mut dialer_event_receiver) = event_loop().await?;
+
+        let peer_addr = {
+            if let Event::NewListenAddr { addr } = dailed_event_receiver.select_next_some().await {
+                addr
+            } else {
+                panic!("Failed to get Multiaddr");
+            }
+        };
+
+        let peer_id = {
+            let (tx, rx) = oneshot::channel();
+
+            let _ = dialed_command.send(Command::PeerId { sender: tx }).await;
+
+            println!("Here");
+            rx.await?
+        };
+
+        let result = {
+            let (sender, rx) = oneshot::channel();
+
+            let _ = dialer_command
+                .send(Command::Dial {
+                    peer_id,
+                    peer_addr,
+                    sender,
+                })
+                .await;
+
+            let _ = rx.await;
+
+            println!("Here 2");
+            dailed_event_receiver.select_next_some().await
+        };
+
+        if let Event::ConnectionEstablished { peer_id, .. } = result {
+            println!("Established connection with {:?}", peer_id);
+            return Ok(());
+        };
+        panic!("Failed");
+    }
+
+    #[tokio::test]
+    async fn test_message() -> Result<(), Box<dyn error::Error>> {
+        let (mut command_sender_messenger, mut event_receiver) = event_loop().await?;
+
+        let (tx, rx) = oneshot::channel();
+
+        command_sender_messenger
+            .send(Command::ListeningAddr { sender: tx })
+            .await?;
+
+        let addr = rx.await?;
+
+        let (tx, rx) = oneshot::channel();
+
+        command_sender_messenger
+            .send(Command::PeerId { sender: tx })
+            .await?;
+
+        let peer_id = rx.await?;
+
+        let (mut command_sender_receiver, _) = event_loop().await?;
+
+        let (tx, rx) = oneshot::channel();
+
+        command_sender_receiver
+            .send(Command::Dial {
+                peer_id,
+                peer_addr: addr,
+                sender: tx,
+            })
+            .await?;
+
+        let _ = rx.await?;
+
+        let topic = Topic::new("test-topic");
+
+        let (tx, rx) = oneshot::channel();
+
+        command_sender_messenger
+            .send(Command::Subscribe {
+                topic: topic.clone(),
+                sender: tx,
+            })
+            .await?;
+
+        let _ = rx.await?;
+
+        let (tx, rx) = oneshot::channel();
+
+        command_sender_receiver
+            .send(Command::Subscribe {
+                topic: topic.clone(),
+                sender: tx,
+            })
+            .await?;
+
+        let _ = rx.await?;
+
+        let (tx, rx) = oneshot::channel();
+
+        command_sender_receiver
+            .send(Command::SendMessage {
+                topic: topic.clone(),
+                message: String::from_str("testing")?,
+                sender: tx,
+            })
+            .await?;
+
+        let _ = rx.await?;
+
         Ok(())
     }
 }
