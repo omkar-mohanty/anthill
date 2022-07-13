@@ -3,14 +3,19 @@ use super::{commands::Command, events::Event};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io;
+use std::str::FromStr;
 use std::time::Duration;
 
+use libp2p::core::either::EitherError;
 use libp2p::core::ConnectedPoint;
 use libp2p::gossipsub::error::GossipsubHandlerError;
 use libp2p::gossipsub::{
     Gossipsub, GossipsubConfigBuilder, GossipsubEvent, GossipsubMessage, IdentTopic as Topic,
     MessageId, TopicHash,
 };
+use libp2p::kad::store::MemoryStore;
+use libp2p::kad::{GetClosestPeersError, Kademlia, KademliaConfig, KademliaEvent, QueryResult};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{development_transport, identity, Multiaddr};
 use libp2p::{multiaddr::Protocol, NetworkBehaviour, PeerId, Swarm};
@@ -38,12 +43,50 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
-    async fn handle_event(&mut self, event: SwarmEvent<ComposedEvent, GossipsubHandlerError>) {
+    async fn handle_event(
+        &mut self,
+        event: SwarmEvent<ComposedEvent, EitherError<GossipsubHandlerError, io::Error>>,
+    ) {
         match event {
             SwarmEvent::Behaviour(ComposedEvent::Gossipsub(event)) => {
                 self.handle_gossipsub_event(event).await
             }
+            SwarmEvent::Behaviour(ComposedEvent::Kademila(event)) => {
+                self.handle_kademila_event(event).await;
+            }
             event => self.handle_swarm_event(event).await,
+        }
+    }
+
+    async fn handle_kademila_event(&mut self, event: KademliaEvent) {
+        match event {
+            KademliaEvent::OutboundQueryCompleted {
+                result: QueryResult::GetClosestPeers(result),
+                ..
+            } => match result {
+                Ok(ok) => {
+                    if !ok.peers.is_empty() {
+                        for peer in ok.peers {
+                            self.swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .add_explicit_peer(&peer);
+                        }
+                    }
+                }
+
+                Err(GetClosestPeersError::Timeout { peers, .. }) => {
+                    if !peers.is_empty() {
+                        for peer in peers {
+                            self.swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .add_explicit_peer(&peer);
+                        }
+                    }
+                }
+            },
+            _ => {}
         }
     }
 
@@ -83,7 +126,7 @@ impl EventLoop {
 
     async fn handle_swarm_event(
         &mut self,
-        event: SwarmEvent<ComposedEvent, GossipsubHandlerError>,
+        event: SwarmEvent<ComposedEvent, EitherError<GossipsubHandlerError, io::Error>>,
     ) {
         match event {
             SwarmEvent::Dialing(peer_id) => {
@@ -161,6 +204,14 @@ impl EventLoop {
             } => {
                 match self.swarm.dial(peer_addr) {
                     Ok(_) => {
+                        let bootaddr = Multiaddr::from_str("/dnsaddr/bootstrap.libp2p.io")
+                            .expect("Bootaddr not parsed");
+
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, bootaddr.clone());
+
                         self.swarm
                             .behaviour_mut()
                             .gossipsub
@@ -228,20 +279,33 @@ impl EventLoop {
             MessageId::from(s.finish().to_string())
         };
 
-        let gossipsub_config = GossipsubConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(1))
-            .validation_mode(libp2p::gossipsub::ValidationMode::Strict)
-            .message_id_fn(message_id_fn)
-            .build()?;
+        let swarm = {
+            let gossipsub_config = GossipsubConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(1))
+                .validation_mode(libp2p::gossipsub::ValidationMode::Strict)
+                .message_id_fn(message_id_fn)
+                .build()?;
 
-        let gossipsub = Gossipsub::new(
-            libp2p::gossipsub::MessageAuthenticity::Signed(keypair),
-            gossipsub_config,
-        )?;
+            let gossipsub = Gossipsub::new(
+                libp2p::gossipsub::MessageAuthenticity::Signed(keypair),
+                gossipsub_config,
+            )?;
 
-        let behaviour = ComposedBehaviour { gossipsub };
+            let mut kademlia_config = KademliaConfig::default();
 
-        let swarm = Swarm::new(transport, behaviour, peer_id);
+            kademlia_config.set_query_timeout(Duration::from_secs(5 * 60));
+
+            let store = MemoryStore::new(peer_id);
+
+            let kademlia = Kademlia::with_config(peer_id, store, kademlia_config);
+
+            let behaviour = ComposedBehaviour {
+                gossipsub,
+                kademlia,
+            };
+
+            Swarm::new(transport, behaviour, peer_id)
+        };
 
         Ok(Self {
             event_sender,
@@ -277,17 +341,25 @@ impl EventLoop {
 #[behaviour(out_event = "ComposedEvent")]
 pub struct ComposedBehaviour {
     gossipsub: Gossipsub,
+    kademlia: Kademlia<MemoryStore>,
 }
 
 /// Libp2p events
 #[derive(Debug)]
 pub enum ComposedEvent {
     Gossipsub(GossipsubEvent),
+    Kademila(KademliaEvent),
 }
 
 impl From<GossipsubEvent> for ComposedEvent {
     fn from(event: GossipsubEvent) -> Self {
         ComposedEvent::Gossipsub(event)
+    }
+}
+
+impl From<KademliaEvent> for ComposedEvent {
+    fn from(event: KademliaEvent) -> Self {
+        ComposedEvent::Kademila(event)
     }
 }
 

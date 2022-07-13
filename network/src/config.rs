@@ -1,21 +1,29 @@
-use std::{error::Error, fmt::Display, path::PathBuf, str::FromStr};
+use std::{error::Error, fmt::Display, str::FromStr};
 
-use clap::{Parser, Subcommand};
-use libp2p::{gossipsub::IdentTopic, PeerId};
+use clap::Subcommand;
+use libp2p::{
+    gossipsub::{IdentTopic, ValidationMode},
+    Multiaddr, PeerId,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Subcommand)]
 pub enum NetworkMode {
-    Ipfs {
-        /// Path for IPFS config file
-        #[clap(short, long, value_name = "path")]
-        path: Option<PathBuf>,
-    },
     Dial {
         /// PeerID's to dial
+        #[clap(value_parser, short, long, value_name = "id")]
         id: Vec<PeerId>,
         /// Topics to subscribe to
-        topic: ConfigTopic,
+        #[clap(value_parser, short, long, value_name = "topic")]
+        topic: Vec<String>,
+    },
+
+    Test {
+        #[clap(value_parser, short, long, value_name = "addr")]
+        addr: Vec<Multiaddr>,
+        /// Topics to subscribe to
+        #[clap(value_parser, short, long, value_name = "topic")]
+        topic: Vec<String>,
     },
 }
 
@@ -40,21 +48,47 @@ impl Into<IdentTopic> for ConfigTopic {
     }
 }
 
-#[derive(Serialize, Deserialize, Parser)]
+/// Imoteph network configuration
 pub struct Config {
     /// Topics to subscribe to
-    topics: Vec<String>,
+    pub topics: Vec<IdentTopic>,
     /// Peer Ids to connect
-    peers: Vec<String>,
+    pub peers: Vec<PeerId>,
     /// Validation mode for gossipsub
-    validation: GossipSubValidationMode,
+    pub validation: GossipSubValidationMode,
+    /// Buffer size
+    pub buffer: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ConfigJson {
+    /// Topics to subscribe to
+    pub topics: Vec<String>,
+    /// Peer Ids to connect
+    pub peers: Vec<String>,
+    /// Validation mode for gossipsub
+    pub validation: GossipSubValidationMode,
+    /// Buffer size
+    pub buffer: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum GossipSubValidationMode {
     Strict,
-    Signed,
-    Author,
+    Permissive,
+    Anonymous,
+    None,
+}
+
+impl Into<ValidationMode> for GossipSubValidationMode {
+    fn into(self) -> ValidationMode {
+        match self {
+            Self::Strict => ValidationMode::Strict,
+            Self::Permissive => ValidationMode::Permissive,
+            Self::Anonymous => ValidationMode::Anonymous,
+            Self::None => ValidationMode::None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,8 +106,9 @@ impl FromStr for GossipSubValidationMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "strict" => Ok(Self::Strict),
-            "Signed" => Ok(Self::Signed),
-            "author" => Ok(Self::Author),
+            "permissive" => Ok(Self::Permissive),
+            "anonymous" => Ok(Self::Permissive),
+            "none" => Ok(Self::None),
             _ => Err(ValidationParseErr),
         }
     }
