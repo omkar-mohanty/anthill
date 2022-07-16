@@ -2,6 +2,8 @@ use super::{commands::Command, events::Event};
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::str::FromStr;
@@ -12,7 +14,7 @@ use libp2p::core::ConnectedPoint;
 use libp2p::gossipsub::error::GossipsubHandlerError;
 use libp2p::gossipsub::{
     Gossipsub, GossipsubConfigBuilder, GossipsubEvent, GossipsubMessage, IdentTopic as Topic,
-    MessageId, TopicHash,
+    MessageId,
 };
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{GetClosestPeersError, Kademlia, KademliaConfig, KademliaEvent, QueryResult};
@@ -39,7 +41,7 @@ pub struct EventLoop {
     /// Current listening address of the node
     listening_addr: Multiaddr,
     /// Topics the node is sibscribed to
-    topics: HashMap<TopicHash, Topic>,
+    topics: HashMap<String, Topic>,
 }
 
 impl EventLoop {
@@ -229,22 +231,32 @@ impl EventLoop {
                 message,
                 sender,
             } => {
-                match self.swarm.behaviour_mut().gossipsub.publish(topic, message) {
-                    Ok(_) => {
-                        let _ = sender.send(Ok(()));
+                if let Some(topic) = self.topics.get(&topic).clone() {
+                    let topic = topic.clone();
+
+                    match self.swarm.behaviour_mut().gossipsub.publish(topic, message) {
+                        Ok(_) => {
+                            let _ = sender.send(Ok(()));
+                        }
+                        Err(err) => {
+                            let _ = sender.send(Err(Box::new(err)));
+                        }
                     }
-                    Err(err) => {
-                        let _ = sender.send(Err(Box::new(err)));
-                    }
-                };
+                } else {
+                    let _ = sender.send(Err(Box::new(NetworkError::TopicNotFound(topic))));
+                }
             }
 
             Command::Subscribe { topic, sender } => {
-                if let Err(err) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
-                    self.topics.insert(topic.hash(), topic);
-                    let _ = sender.send(Err(Box::new(err)));
-                } else {
-                    let _ = sender.send(Ok(()));
+                if let None = self.topics.get(&topic) {
+                    let new_topic = Topic::new(topic.clone());
+                    if let Err(err) = self.swarm.behaviour_mut().gossipsub.subscribe(&new_topic) {
+                        let _ = sender.send(Err(Box::new(err)));
+                    } else {
+                        println!("Successfully subscribed");
+                        self.topics.insert(topic, new_topic);
+                        let _ = sender.send(Ok(()));
+                    }
                 }
             }
 
@@ -330,6 +342,23 @@ impl EventLoop {
                 command = self.command_receiver.select_next_some() => {
                         self.handle_command(command).await;
                 }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum NetworkError {
+    TopicNotFound(String),
+}
+
+impl Error for NetworkError {}
+
+impl Display for NetworkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TopicNotFound(topic) => {
+                write!(f, "Topic {} not subscribed to", topic)
             }
         }
     }
