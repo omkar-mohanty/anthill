@@ -1,37 +1,70 @@
+use std::str::FromStr;
+
 use async_std::task::spawn;
 use clap::Parser;
 use futures::{channel::mpsc, StreamExt};
-use network::{config::NetworkMode, events::Event, client::Client};
+use network::{client::Client, config::NetworkMode, events::Event};
+use tokio::io::{self, AsyncBufReadExt};
 
 #[derive(Parser)]
 pub struct Cli {
-    /// Set IPFS or private network.
+    /// IPFS only for now  
     #[clap(subcommand)]
-    command: NetworkMode,
+    command: Option<NetworkMode>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let (client, event_receiver) = network::new().await?;
+    let (client, event_receiver) = network::new().await.expect("Event loop not formed");
 
     spawn(event_receiver_loop(event_receiver));
 
-    Ok(())
+    handle_client(client, cli.command).await
 }
 
-async fn handle_client(client: Client,mode: NetworkMode) -> Result<(), Box<dyn std::error::Error>> {
-    match mode {
-        NetworkMode::Test { addr, topic } => {
-           for addr in addr {
-                client.dial(peer_id, addr);
-           } 
+async fn handle_client(
+    mut client: Client,
+    mode: Option<NetworkMode>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    client
+        .start_listening("/ip4/0.0.0.0/tcp/0".parse()?)
+        .await
+        .expect("Should listen on addressed");
+
+    if let Some(mode) = mode {
+        match mode {
+            NetworkMode::Test { id, addr } => {
+                client
+                    .dial(id, addr)
+                    .await
+                    .expect("Receiver not to be dropped");
+                client
+                    .subscribe(String::from_str("test-topic")?)
+                    .await
+                    .expect("Receiver not to be dropped");
+            }
+            _ => {}
         }
-         _ => {}
+    } else {
+        client
+            .subscribe(String::from_str("test-topic")?)
+            .await
+            .expect("Receiver not to be dropped");
     }
 
-    Ok(())
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
+
+    loop {
+        tokio::select! {
+            line = stdin.next_line() => {
+                let line = line?.expect("stdin closed");
+                let topic = String::from_str("test-topic")?;
+                client.send_message(topic,line).await.expect("client not to be closed");
+            }
+        }
+    }
 }
 
 async fn event_receiver_loop(mut event_receiver: mpsc::Receiver<Event>) {

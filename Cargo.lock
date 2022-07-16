@@ -1076,6 +1076,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "imoteph-cli"
+version = "0.1.0"
+dependencies = [
+ "async-std",
+ "async-trait",
+ "clap",
+ "futures",
+ "libp2p",
+ "network",
+ "tokio",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2781,19 +2794,6 @@ name = "signature"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f054c6c1a6e95179d6f23ed974060dcefb2d9388bb7256900badad682c499de4"
-
-[[package]]
-name = "skyctl"
-version = "0.1.0"
-dependencies = [
- "async-std",
- "async-trait",
- "clap",
- "futures",
- "libp2p",
- "network",
- "tokio",
-]
 
 [[package]]
 name = "skyd"
