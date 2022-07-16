@@ -3,7 +3,7 @@ use futures::{
     SinkExt,
 };
 
-use libp2p::{gossipsub::IdentTopic, Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId};
 
 use std::error::Error;
 
@@ -50,12 +50,10 @@ impl Client {
     /// Publish message to the network
     pub async fn send_message(
         &mut self,
-        topic_name: String,
+        topic: String,
         message: String,
     ) -> Result<(), Box<dyn Error + Send>> {
         let (sender, receiver) = oneshot::channel();
-
-        let topic = IdentTopic::new(topic_name);
 
         self.command_sender
             .send(Command::SendMessage {
@@ -69,10 +67,9 @@ impl Client {
         receiver.await.expect("Sender not to be dropped")
     }
 
-    pub async fn subscribe(&mut self, topic_name: String) -> Result<(), Box<dyn Error + Send>> {
+    /// Subscribe to a gossipsub topic
+    pub async fn subscribe(&mut self, topic: String) -> Result<(), Box<dyn Error + Send>> {
         let (sender, receiver) = oneshot::channel();
-
-        let topic = IdentTopic::new(topic_name);
 
         self.command_sender
             .send(Command::Subscribe { topic, sender })
