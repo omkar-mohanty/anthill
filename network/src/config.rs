@@ -19,11 +19,12 @@ pub enum NetworkMode {
     },
 
     Test {
+        /// PeerId of the test peer to dial
+        #[clap(value_parser, short, long, value_name = "id")]
+        id: PeerId,
+        /// Address of the peer to dial
         #[clap(value_parser, short, long, value_name = "addr")]
-        addr: Vec<Multiaddr>,
-        /// Topics to subscribe to
-        #[clap(value_parser, short, long, value_name = "topic")]
-        topic: Vec<String>,
+        addr: Multiaddr,
     },
 }
 
@@ -74,8 +75,11 @@ pub struct ConfigJson {
 
 #[derive(Serialize, Deserialize)]
 pub enum GossipSubValidationMode {
+    /// Gossipsub strict mode
     Strict,
+    /// Gossipsub permissive mode
     Permissive,
+    /// Gossipsub Anonymous mode
     Anonymous,
     None,
 }
@@ -101,6 +105,7 @@ impl Display for ValidationParseErr {
         write!(f, "could not parse validation mode")
     }
 }
+
 impl FromStr for GossipSubValidationMode {
     type Err = ValidationParseErr;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
