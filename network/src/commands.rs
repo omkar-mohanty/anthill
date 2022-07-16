@@ -1,5 +1,5 @@
 use futures::channel::oneshot::Sender;
-use libp2p::{gossipsub::IdentTopic as Topic, Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId};
 use std::error::Error;
 #[derive(Debug)]
 pub enum Command {
@@ -13,12 +13,12 @@ pub enum Command {
         sender: Sender<Result<(), Box<dyn Error + Send>>>,
     },
     SendMessage {
-        topic: Topic,
+        topic: String,
         message: String,
         sender: Sender<Result<(), Box<dyn Error + Send>>>,
     },
     Subscribe {
-        topic: Topic,
+        topic: String,
         sender: Sender<Result<(), Box<dyn Error + Send>>>,
     },
     PeerId {
