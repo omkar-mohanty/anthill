@@ -27,4 +27,11 @@ pub enum Command {
     ListeningAddr {
         sender: Sender<Multiaddr>,
     },
+    IpfsInit {
+        sender: Sender<Result<(), Box<dyn Error + Send>>>,
+    },
+    IpfsDial {
+        peer_id: PeerId,
+        sender: Sender<Result<(), Box<dyn Error + Send>>>,
+    },
 }
