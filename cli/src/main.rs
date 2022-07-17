@@ -19,13 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (client, event_receiver) = network::new().await.expect("Event loop not formed");
 
-    spawn(event_receiver_loop(event_receiver));
-
-    handle_client(client, cli.command).await
+    handle_client(client, event_receiver, cli.command).await
 }
 
 async fn handle_client(
     mut client: Client,
+    mut event_receiver: mpsc::Receiver<Event>,
     mode: Option<NetworkMode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     client
@@ -63,14 +62,9 @@ async fn handle_client(
                 let topic = String::from_str("test-topic")?;
                 client.send_message(topic,line).await.expect("client not to be closed");
             }
-        }
-    }
-}
-
-async fn event_receiver_loop(mut event_receiver: mpsc::Receiver<Event>) {
-    futures::select! {
-        event = event_receiver.select_next_some() => {
-            handle_event(event).await;
+            event = event_receiver.select_next_some() => {
+                    handle_event(event).await;
+            }
         }
     }
 }
