@@ -63,7 +63,6 @@ impl Client {
             })
             .await
             .expect("Command Receiver not to be dropped");
-
         receiver.await.expect("Sender not to be dropped")
     }
 
