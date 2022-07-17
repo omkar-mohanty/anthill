@@ -1,10 +1,8 @@
 use super::{commands::Command, events::Event};
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::str::FromStr;
 use std::time::Duration;
@@ -18,12 +16,22 @@ use libp2p::gossipsub::{
 };
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{GetClosestPeersError, Kademlia, KademliaConfig, KademliaEvent, QueryResult};
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::{
+    dial_opts::{DialOpts, PeerCondition},
+    SwarmEvent,
+};
 use libp2p::{development_transport, identity, Multiaddr};
 use libp2p::{multiaddr::Protocol, NetworkBehaviour, PeerId, Swarm};
 
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
+
+const BOOTNODES: [&'static str; 4] = [
+    "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+    "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+    "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+];
 
 /// Main event loop of the application
 /// Can run independently from any other component.
@@ -234,7 +242,12 @@ impl EventLoop {
                 if let Some(topic) = self.topics.get(&topic).clone() {
                     let topic = topic.clone();
 
-                    match self.swarm.behaviour_mut().gossipsub.publish(topic, message) {
+                    match self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(topic, message.clone())
+                    {
                         Ok(_) => {
                             let _ = sender.send(Ok(()));
                         }
@@ -271,6 +284,38 @@ impl EventLoop {
 
                 let _ = sender.send(listening_addr);
             }
+
+            Command::IpfsInit { sender } => {
+                let bootaddr = Multiaddr::from_str("/dnsaddr/bootstrap.libp2p.io")
+                    .expect("Should parse bootaddr");
+                for peer in &BOOTNODES {
+                    let peer = PeerId::from_str(peer).expect("PeerId must be valid");
+
+                    let addr: Multiaddr = format!("{}/{}", bootaddr, peer)
+                        .parse()
+                        .expect("Must be valid peer ID and Multiaddr");
+
+                    if let Ok(_) = self.swarm.dial(addr) {
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer, bootaddr.clone());
+                    } else {
+                        let _ = sender.send(Err(Box::new(NetworkError::DialError(format!("Could not dial {}",peer)))));
+                        return;
+                    }
+                }
+
+                let _ = sender.send(Ok(()));
+            }
+            Command::IpfsDial { peer_id, sender } => {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .get_closest_peers(peer_id);
+
+                let _ = sender.send(Ok(()));
+            }
         }
     }
 
@@ -285,17 +330,10 @@ impl EventLoop {
 
         let transport = development_transport(keypair.clone()).await?;
 
-        let message_id_fn = |message: &GossipsubMessage| {
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            MessageId::from(s.finish().to_string())
-        };
-
         let swarm = {
             let gossipsub_config = GossipsubConfigBuilder::default()
                 .heartbeat_interval(Duration::from_secs(1))
                 .validation_mode(libp2p::gossipsub::ValidationMode::Strict)
-                .message_id_fn(message_id_fn)
                 .build()?;
 
             let gossipsub = Gossipsub::new(
@@ -350,6 +388,7 @@ impl EventLoop {
 #[derive(Debug)]
 enum NetworkError {
     TopicNotFound(String),
+    DialError(String),
 }
 
 impl Error for NetworkError {}
@@ -359,6 +398,9 @@ impl Display for NetworkError {
         match self {
             Self::TopicNotFound(topic) => {
                 write!(f, "Topic {} not subscribed to", topic)
+            }
+            Self::DialError(message) => {
+                write!(f, "{}",message)
             }
         }
     }
