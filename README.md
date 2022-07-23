@@ -74,6 +74,7 @@ async fn handle_event(event: Event) {
 ### Clone the repo
  ```shell
  git clone https://github.com/omkar-mohanty/imhoteph.git
+ cd imhoteph
  ```
  ### Build Imhoteph
  ```shel
@@ -81,7 +82,7 @@ async fn handle_event(event: Event) {
  ```
  ### Run the application
  ```shell
- cd imhoteph/target/debug
+ cd target/debug
  ./imhoteph-cli
  ```
  
